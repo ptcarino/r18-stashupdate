@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 from stashapi.stashapp import StashInterface
 from camoufox.sync_api import Camoufox
 
-from lib import r18_gallery
-from lib import r18_image_scrape as r18_imagedownload
+import r18_gallery
+import r18_image_scrape as r18_imagedownload
 
 load_dotenv()
 
@@ -108,43 +108,54 @@ def parse_content_id_to_dvd(content_id):
 
 def build_reverse_map():
     """
-    Build a reverse lookup from DVD prefix (e.g. 'SNOS-') to
-    (content_id_prefix, number_padding) from ID_MAP.
-    number_padding is the count of trailing digits in the mapping key,
-    used to reconstruct the zero-padded number portion.
-    e.g. 'snos00' -> ('SNOS-', 'snos00', 2)
+    Build a reverse lookup from DVD prefix (e.g. 'WANZ-') to a list of
+    (content_id_prefix, padding) tuples, sorted by key length descending
+    (most specific / longest key first).
+
+    Handles cases where multiple content ID prefixes map to the same DVD prefix,
+    e.g. both 'wanz00' and '3wanz00' map to 'WANZ-'.
     """
     reverse = {}
     for key, dvd_prefix in ID_MAP.items():
-        # Count trailing digits in the key to determine number padding
         trailing = len(key) - len(key.rstrip('0123456789'))
-        reverse[dvd_prefix.upper()] = (key, trailing)
+        entry = (key, trailing)
+        dvd_upper = dvd_prefix.upper()
+        if dvd_upper not in reverse:
+            reverse[dvd_upper] = []
+        reverse[dvd_upper].append(entry)
+    # Sort each candidate list by key length descending (longest = most specific first)
+    for dvd_prefix in reverse:
+        reverse[dvd_prefix].sort(key=lambda x: len(x[0]), reverse=True)
     return reverse
 
 _REVERSE_MAP = build_reverse_map() if ID_MAP else {}
 
 
-def dvd_to_content_id(dvd_id):
+def dvd_to_content_id_candidates(dvd_id):
     """
-    Convert a DVD ID (e.g. 'SNOS-066') back to a DMM content ID (e.g. 'snos00066').
-    Uses the reverse mapping built from ID_MAP.
-    Falls back to returning the original dvd_id lowercased if no mapping is found.
+    Convert a DVD ID (e.g. 'WANZ-066') to a list of candidate DMM content IDs,
+    ordered by specificity (longest mapping key first).
+
+    e.g. 'WANZ-066' -> ['3wanz00066', 'wanz00066']
+
+    Falls back to [dvd_id.lower()] if no mapping is found.
     """
     dvd_id = dvd_id.strip()
     if '-' not in dvd_id:
-        return dvd_id.lower()
+        return [dvd_id.lower()]
 
-    dash_pos  = dvd_id.index('-')
-    dvd_prefix = dvd_id[:dash_pos + 1].upper()  # e.g. 'SNOS-'
-    number     = dvd_id[dash_pos + 1:]           # e.g. '066'
+    dash_pos   = dvd_id.index('-')
+    dvd_prefix = dvd_id[:dash_pos + 1].upper()
+    number     = dvd_id[dash_pos + 1:]
 
     if dvd_prefix not in _REVERSE_MAP:
-        return dvd_id.lower()
+        return [dvd_id.lower()]
 
-    content_prefix, padding = _REVERSE_MAP[dvd_prefix]
-    # Zero-pad the number to at least `padding` digits
-    padded_number = number.zfill(padding) if padding > 0 else number
-    return f"{content_prefix}{padded_number}"
+    candidates = []
+    for content_prefix, padding in _REVERSE_MAP[dvd_prefix]:
+        padded_number = number.zfill(padding) if padding > 0 else number
+        candidates.append(f"{content_prefix}{padded_number}")
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -154,9 +165,9 @@ def dvd_to_content_id(dvd_id):
 def get_unprocessed_scene_ids():
     """
     Query Stash for scenes created within AUTO_CREATED_WITHIN minutes that have
-    no code, title, or studio set. Extracts content IDs from filenames.
+    no code, title, or studio set. Extracts content ID candidates from filenames.
     Skips scenes whose filenames match AUTO_BLOCKED_PREFIXES or cannot be parsed.
-    Returns a deduplicated list of content ID strings.
+    Returns a deduplicated list of (filename, [candidate_content_ids]) tuples.
     """
     from datetime import datetime, timezone, timedelta
 
@@ -193,7 +204,8 @@ def get_unprocessed_scene_ids():
         print(f"[!] Failed to query unprocessed scenes: {type(e).__name__}: {e}")
         return []
 
-    ids = []
+    entries = []
+    seen    = set()
     skipped = 0
     for scene in scenes:
         files = scene.get("files", [])
@@ -221,14 +233,13 @@ def get_unprocessed_scene_ids():
             skipped += 1
             continue
 
-        # Convert DVD ID format back to content ID if a mapping exists
-        content_id = dvd_to_content_id(filename)
-        if content_id != filename.lower():
-            print(f"[~] Mapped {filename} -> {content_id}")
-        ids.append(content_id)
+        candidates = dvd_to_content_id_candidates(filename)
+        if candidates != [filename.lower()]:
+            print(f"[~] Mapped {filename} -> {candidates}")
+        entries.append((filename, candidates))
 
-    print(f"[*] Found {len(ids)} unprocessed scene(s) in Stash ({skipped} skipped).")
-    return list(dict.fromkeys(ids))  # deduplicate while preserving order
+    print(f"[*] Found {len(entries)} unprocessed scene(s) in Stash ({skipped} skipped).")
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -470,9 +481,12 @@ def scrape_r18(browser, identifier):
 # Phase 1 — scrape + download
 # ---------------------------------------------------------------------------
 
-def phase1_scrape_and_download(tid, proxy, results):
+def phase1_scrape_and_download(tid, proxy, results, candidates=None):
     """
     Scrape r18.dev and download gallery images for `tid`.
+    If `candidates` is provided (list of content IDs to try in order),
+    each is attempted until one succeeds. Used by --auto mode for ambiguous
+    reverse mappings (e.g. multiple content prefixes mapping to the same DVD ID).
     Stores result metadata into the shared `results` dict keyed by tid.
     """
     result_msg = f"[!] Unknown error: {tid}"
@@ -480,10 +494,17 @@ def phase1_scrape_and_download(tid, proxy, results):
     try:
         clean_tid = RE_EXTENSIONS.sub('', tid).strip()
         browser   = get_browser(proxy)
-        meta      = scrape_r18(browser, clean_tid)
+        meta      = None
+        tried     = candidates if candidates else [clean_tid]
+
+        for candidate in tried:
+            meta = scrape_r18(browser, candidate)
+            if meta:
+                clean_tid = candidate  # use the successful candidate going forward
+                break
 
         if not meta:
-            result_msg = f"[!] Failed scrape: {clean_tid}"
+            result_msg = f"[!] Failed scrape: {tid}"
         else:
             dvd_id = meta['display_id']
 
@@ -628,15 +649,19 @@ def main():
         run_library_scan()
 
         print("[*] Querying Stash for unprocessed scenes...")
-        ids = get_unprocessed_scene_ids()
-        if not ids:
+        entries = get_unprocessed_scene_ids()
+        if not entries:
             print("[!] No unprocessed scenes found — nothing to do.")
             return
+        # entries is a list of (filename, [candidates]) tuples
+        ids            = [e[0] for e in entries]
+        candidates_map = {e[0]: e[1] for e in entries}
     else:
         if not INPUT_FILE or not os.path.exists(INPUT_FILE):
             return print(f"[!] INPUT_FILE '{INPUT_FILE}' not found.")
         with open(INPUT_FILE, "r") as f:
             ids = list(dict.fromkeys(line.strip() for line in f if line.strip()))
+        candidates_map = {}
 
     proxy = PROXY_CONFIG if USE_PROXY else None
 
@@ -650,7 +675,11 @@ def main():
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for tid in ids:
-            executor.submit(phase1_scrape_and_download, tid, proxy, phase1_results)
+            executor.submit(
+                phase1_scrape_and_download,
+                tid, proxy, phase1_results,
+                candidates_map.get(tid)  # None for default mode, list for --auto
+            )
         for _ in range(MAX_WORKERS):
             executor.submit(close_thread_browser)
 

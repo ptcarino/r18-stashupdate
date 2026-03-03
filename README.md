@@ -51,10 +51,12 @@ pip install camoufox stashapp-tools python-dotenv requests
 
 ```
 r18_main.py          # Main script — orchestrates the full pipeline
-r18_gallery.py       # Gallery querying and matching logic
-r18_image_scrape.py  # Image downloader (cover + sample images from DMM)
 mapping.json         # Content ID prefix → DVD ID prefix mappings
 .env                 # Your local config (not committed)
+lib/
+  __init__.py
+  r18_gallery.py     # Gallery querying and matching logic
+  r18_image_scrape.py  # Image downloader (cover + sample images from DMM)
 ```
 
 ---

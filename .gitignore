@@ -1,0 +1,5 @@
+.env
+codeupdate.txt
+failed_ids.txt
+__pycache__/
+*.pyc

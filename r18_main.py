@@ -14,6 +14,7 @@ from camoufox.sync_api import Camoufox
 import r18_gallery
 import r18_image_scrape as r18_imagedownload
 
+# Load env files
 load_dotenv()
 
 STASH_CONFIG = {

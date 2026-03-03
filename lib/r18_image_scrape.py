@@ -19,14 +19,10 @@ def download_gallery_images(content_id, dvd_id, gallery_path):
     base_url = f"{DMM_IMG_BASE}/{content_id}"
 
     # --- Cover image ---
-    cover_url      = f"{base_url}/{content_id}pl.jpg"
-    cover_filename = "cover.jpg"
-    cover_dest     = gallery_folder / cover_filename
-    if cover_dest.exists():
-        pass  # already downloaded
-    else:
+    cover_dest = gallery_folder / "cover.jpg"
+    if not cover_dest.exists():
         try:
-            r = requests.get(cover_url, timeout=15)
+            r = requests.get(f"{base_url}/{content_id}pl.jpg", timeout=15)
             if r.status_code == 200:
                 cover_dest.write_bytes(r.content)
             else:
